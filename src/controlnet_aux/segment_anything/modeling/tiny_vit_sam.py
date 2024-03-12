@@ -9,14 +9,172 @@
 
 import itertools
 import torch
+import sys
 import torch.nn as nn
 import torch.nn.functional as F
+from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Sequence, Union, Tuple, Deque
 import torch.utils.checkpoint as checkpoint
 from timm.models.layers import DropPath as TimmDropPath,\
     to_2tuple, trunc_normal_
-from timm.models.registry import register_model
 from typing import Tuple
+from collections import defaultdict, deque
+from dataclasses import replace, dataclass, asdict, field
 
+@dataclass
+class PretrainedCfg:
+    """
+    """
+    # weight source locations
+    url: Optional[Union[str, Tuple[str, str]]] = None  # remote URL
+    file: Optional[str] = None  # local / shared filesystem path
+    state_dict: Optional[Dict[str, Any]] = None  # in-memory state dict
+    hf_hub_id: Optional[str] = None  # Hugging Face Hub model id ('organization/model')
+    hf_hub_filename: Optional[str] = None  # Hugging Face Hub filename (overrides default)
+
+    source: Optional[str] = None  # source of cfg / weight location used (url, file, hf-hub)
+    architecture: Optional[str] = None  # architecture variant can be set when not implicit
+    tag: Optional[str] = None  # pretrained tag of source
+    custom_load: bool = False  # use custom model specific model.load_pretrained() (ie for npz files)
+
+    # input / data config
+    input_size: Tuple[int, int, int] = (3, 224, 224)
+    test_input_size: Optional[Tuple[int, int, int]] = None
+    min_input_size: Optional[Tuple[int, int, int]] = None
+    fixed_input_size: bool = False
+    interpolation: str = 'bicubic'
+    crop_pct: float = 0.875
+    test_crop_pct: Optional[float] = None
+    crop_mode: str = 'center'
+    mean: Tuple[float, ...] = (0.485, 0.456, 0.406)
+    std: Tuple[float, ...] = (0.229, 0.224, 0.225)
+
+    # head / classifier config and meta-data
+    num_classes: int = 1000
+    label_offset: Optional[int] = None
+    label_names: Optional[Tuple[str]] = None
+    label_descriptions: Optional[Dict[str, str]] = None
+
+    # model attributes that vary with above or required for pretrained adaptation
+    pool_size: Optional[Tuple[int, ...]] = None
+    test_pool_size: Optional[Tuple[int, ...]] = None
+    first_conv: Optional[str] = None
+    classifier: Optional[str] = None
+
+    license: Optional[str] = None
+    description: Optional[str] = None
+    origin_url: Optional[str] = None
+    paper_name: Optional[str] = None
+    paper_ids: Optional[Union[str, Tuple[str]]] = None
+    notes: Optional[Tuple[str]] = None
+
+    @property
+    def has_weights(self):
+        return self.url or self.file or self.hf_hub_id
+
+    def to_dict(self, remove_source=False, remove_null=True):
+        return filter_pretrained_cfg(
+            asdict(self),
+            remove_source=remove_source,
+            remove_null=remove_null
+        )
+
+def filter_pretrained_cfg(cfg, remove_source=False, remove_null=True):
+    filtered_cfg = {}
+    keep_null = {'pool_size', 'first_conv', 'classifier'}  # always keep these keys, even if none
+    for k, v in cfg.items():
+        if remove_source and k in {'url', 'file', 'hf_hub_id', 'hf_hub_id', 'hf_hub_filename', 'source'}:
+            continue
+        if remove_null and v is None and k not in keep_null:
+            continue
+        filtered_cfg[k] = v
+    return filtered_cfg
+
+@dataclass
+class DefaultCfg:
+    tags: Deque[str] = field(default_factory=deque)  # priority queue of tags (first is default)
+    cfgs: Dict[str, PretrainedCfg] = field(default_factory=dict)  # pretrained cfgs by tag
+    is_pretrained: bool = False  # at least one of the configs has a pretrained source set
+
+    @property
+    def default(self):
+        return self.cfgs[self.tags[0]]
+
+    @property
+    def default_with_tag(self):
+        tag = self.tags[0]
+        return tag, self.cfgs[tag]
+
+__all__ = [
+    'split_model_name_tag', 'get_arch_name', 'register_model', 'generate_default_cfgs',
+    'list_models', 'list_pretrained', 'is_model', 'model_entrypoint', 'list_modules', 'is_model_in_modules',
+    'get_pretrained_cfg_value', 'is_model_pretrained'
+]
+
+_module_to_models: Dict[str, Set[str]] = defaultdict(set)  # dict of sets to check membership of model in module
+_model_to_module: Dict[str, str] = {}  # mapping of model names to module names
+_model_entrypoints: Dict[str, Callable[..., Any]] = {}  # mapping of model names to architecture entrypoint fns
+_model_has_pretrained: Set[str] = set()  # set of model names that have pretrained weight url present
+_model_default_cfgs: Dict[str, PretrainedCfg] = {}  # central repo for model arch -> default cfg objects
+_model_pretrained_cfgs: Dict[str, PretrainedCfg] = {}  # central repo for model arch.tag -> pretrained cfgs
+_model_with_tags: Dict[str, List[str]] = defaultdict(list)  # shortcut to map each model arch to all model + tag names
+_module_to_deprecated_models: Dict[str, Dict[str, Optional[str]]] = defaultdict(dict)
+_deprecated_models: Dict[str, Optional[str]] = {}
+
+def register_model(fn: Callable[..., Any]) -> Callable[..., Any]:
+    # lookup containing module
+    mod = sys.modules[fn.__module__]
+    module_name_split = fn.__module__.split('.')
+    module_name = module_name_split[-1] if len(module_name_split) else ''
+
+    # add model to __all__ in module
+    model_name = fn.__name__
+    if hasattr(mod, '__all__'):
+        mod.__all__.append(model_name)
+    else:
+        mod.__all__ = [model_name]  # type: ignore
+
+    _model_entrypoints[model_name] = fn
+    _model_to_module[model_name] = module_name
+    _module_to_models[module_name].add(model_name)
+    if hasattr(mod, 'default_cfgs') and model_name in mod.default_cfgs:
+        # this will catch all models that have entrypoint matching cfg key, but miss any aliasing
+        # entrypoints or non-matching combos
+        default_cfg = mod.default_cfgs[model_name]
+        if not isinstance(default_cfg, DefaultCfg):
+            # new style default cfg dataclass w/ multiple entries per model-arch
+            assert isinstance(default_cfg, dict)
+            # old style cfg dict per model-arch
+            pretrained_cfg = PretrainedCfg(**default_cfg)
+            default_cfg = DefaultCfg(tags=deque(['']), cfgs={'': pretrained_cfg})
+
+        for tag_idx, tag in enumerate(default_cfg.tags):
+            is_default = tag_idx == 0
+            pretrained_cfg = default_cfg.cfgs[tag]
+            model_name_tag = '.'.join([model_name, tag]) if tag else model_name
+            replace_items = dict(architecture=model_name, tag=tag if tag else None)
+            if pretrained_cfg.hf_hub_id and pretrained_cfg.hf_hub_id == 'timm/':
+                # auto-complete hub name w/ architecture.tag
+                replace_items['hf_hub_id'] = pretrained_cfg.hf_hub_id + model_name_tag
+            pretrained_cfg = replace(pretrained_cfg, **replace_items)
+
+            if is_default:
+                _model_pretrained_cfgs[model_name] = pretrained_cfg
+                if pretrained_cfg.has_weights:
+                    # add tagless entry if it's default and has weights
+                    _model_has_pretrained.add(model_name)
+
+            if tag:
+                _model_pretrained_cfgs[model_name_tag] = pretrained_cfg
+                if pretrained_cfg.has_weights:
+                    # add model w/ tag if tag is valid
+                    _model_has_pretrained.add(model_name_tag)
+                _model_with_tags[model_name].append(model_name_tag)
+            else:
+                _model_with_tags[model_name].append(model_name)  # has empty tag (to slowly remove these instances)
+
+        _model_default_cfgs[model_name] = default_cfg
+
+    return fn
 
 class Conv2d_BN(torch.nn.Sequential):
     def __init__(self, a, b, ks=1, stride=1, pad=0, dilation=1,
